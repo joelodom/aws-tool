@@ -27,6 +27,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
@@ -70,6 +71,20 @@ def pick_from_menu(prompt: str, options: list[str], allow_cancel: bool = True) -
     if allow_cancel:
         console.print("   [bold]0)[/bold] [dim]Back[/dim]")
     valid = [str(i) for i in range(0 if allow_cancel else 1, len(options) + 1)]
+    choice = IntPrompt.ask(prompt, choices=valid, show_choices=False)
+    if allow_cancel and choice == 0:
+        return None
+    return choice - 1
+
+
+def pick_number(prompt: str, count: int, allow_cancel: bool = True) -> int | None:
+    """Prompt for a number 1..count (or 0 for back). Returns 0-based index or None.
+
+    Use this when the choices are already shown to the user in a rich Table
+    (so we don't want pick_from_menu's duplicate numbered list)."""
+    if allow_cancel:
+        console.print("   [bold]0)[/bold] [dim]Back[/dim]")
+    valid = [str(i) for i in range(0 if allow_cancel else 1, count + 1)]
     choice = IntPrompt.ask(prompt, choices=valid, show_choices=False)
     if allow_cancel and choice == 0:
         return None
@@ -208,6 +223,46 @@ def _find_key_path(key_name: str) -> str:
     return f"<path-to-your-{key_name or 'ssh'}-key>"
 
 
+def _describe_types_batch(ec2, type_names) -> dict:
+    """describe_instance_types caps at 100 InstanceTypes per call AND has a
+    small default page size — so we batch in 100-name chunks and paginate
+    each batch to make sure we get every result back."""
+    result = {}
+    names = list(type_names)
+    paginator = ec2.get_paginator('describe_instance_types')
+    for i in range(0, len(names), 100):
+        for page in paginator.paginate(InstanceTypes=names[i:i + 100]):
+            for t in page['InstanceTypes']:
+                result[t['InstanceType']] = t
+    return result
+
+
+def _wait_for_state(ec2, inst_id: str, target_state: str, action_label: str,
+                    poll_interval: int = 5) -> None:
+    """Poll DescribeInstances every poll_interval seconds, showing live state
+    and elapsed time. Replaces the silent boto3 waiter so the user sees the
+    instance walking through 'stopping' -> 'stopped' (or 'pending' -> 'running')
+    instead of staring at a frozen line for ~60s."""
+    start = time.monotonic()
+    state = "unknown"
+    with console.status(f"[cyan]{action_label}[/cyan] {inst_id}...", spinner="dots") as status:
+        while True:
+            info = ec2.describe_instances(InstanceIds=[inst_id])['Reservations'][0]['Instances'][0]
+            state = info['State']['Name']
+            elapsed = int(time.monotonic() - start)
+            status.update(
+                f"[cyan]{action_label}[/cyan] {inst_id}  "
+                f"state=[yellow]{state}[/yellow]  elapsed={elapsed}s"
+            )
+            if state == target_state:
+                break
+            time.sleep(poll_interval)
+    console.print(
+        f"[green]✓[/green] {inst_id} is now [green]{state}[/green] "
+        f"[dim]({int(time.monotonic() - start)}s)[/dim]"
+    )
+
+
 def action_resize_instance(region: str) -> None:
     ec2 = boto3.client('ec2', region_name=region)
     # Pricing is a global service with regional endpoint only in us-east-1
@@ -215,184 +270,288 @@ def action_resize_instance(region: str) -> None:
     pricing = boto3.client('pricing', region_name='us-east-1')
     location = REGION_TO_LOCATION.get(region)
 
-    # --- pick instance ---
     console.print(f"\n[dim]Fetching EC2 instances in {region}...[/dim]")
     instances = list_instances(ec2)
     if not instances:
         console.print(f"[yellow]No EC2 instances in {region}.[/yellow]")
         return
 
-    table = Table(title=f"EC2 instances in {region}")
-    table.add_column("#", justify="right")
-    table.add_column("Name", style="cyan")
-    table.add_column("ID")
-    table.add_column("Type")
-    table.add_column("State")
-    for i, inst in enumerate(instances, 1):
-        table.add_row(str(i), name_of(inst) or "(no name)",
-                      inst['InstanceId'], inst['InstanceType'],
-                      style_state(inst['State']['Name']))
-    console.print(table)
+    # Each menu level is a loop. "Back" (0) breaks to the outer loop and
+    # re-displays it; invalid picks `continue` so the user re-picks at the
+    # same level. Back from the outermost (instance) loop returns from
+    # the action entirely.
 
-    pick = pick_from_menu("Pick an instance", [i['InstanceId'] for i in instances])
-    if pick is None:
-        return
-    sel = instances[pick]
-    inst_id = sel['InstanceId']
-    current_type = sel['InstanceType']
-    current_state = sel['State']['Name']
-    arch = sel['Architecture']
-    ami_id = sel.get('ImageId', '')
-    key_name = sel.get('KeyName', '')
+    while True:  # --- L1: pick instance ---
+        inst_table = Table(title=f"EC2 instances in {region}")
+        inst_table.add_column("#", justify="right")
+        inst_table.add_column("Name", style="cyan")
+        inst_table.add_column("ID")
+        inst_table.add_column("Type")
+        inst_table.add_column("State")
+        for i, inst in enumerate(instances, 1):
+            inst_table.add_row(str(i), name_of(inst) or "(no name)",
+                               inst['InstanceId'], inst['InstanceType'],
+                               style_state(inst['State']['Name']))
+        console.print(inst_table)
 
-    if current_state not in ('running', 'stopped'):
-        console.print(f"[red]Instance is in state '{current_state}' — can only resize 'running' or 'stopped'.[/red]")
-        return
+        pick = pick_number("Pick an instance", len(instances))
+        if pick is None:
+            return
+        sel = instances[pick]
+        inst_id = sel['InstanceId']
+        current_type = sel['InstanceType']
+        current_state = sel['State']['Name']
+        arch = sel['Architecture']
+        ami_id = sel.get('ImageId', '')
+        key_name = sel.get('KeyName', '')
 
-    cur = ec2.describe_instance_types(InstanceTypes=[current_type])['InstanceTypes'][0]
-    console.print(
-        f"\n[bold]Current:[/bold] [cyan]{current_type}[/cyan]  "
-        f"vCPU={cur['VCpuInfo']['DefaultVCpus']}  "
-        f"mem={cur['MemoryInfo']['SizeInMiB']/1024:.1f} GiB  "
-        f"net={cur['NetworkInfo']['NetworkPerformance']}  "
-        f"state={style_state(current_state)}  arch={arch}"
-    )
+        if current_state not in ('running', 'stopped'):
+            console.print(f"[red]Instance is in state '{current_state}' — can only resize 'running' or 'stopped'.[/red]")
+            continue
 
-    # --- pick category ---
-    console.print("\n[bold]Instance type categories[/bold]")
-    cat_pick = pick_from_menu("Pick a category", [c[0] for c in CATEGORIES])
-    if cat_pick is None:
-        return
-    pattern = re.compile(CATEGORIES[cat_pick][1])
-
-    # --- pick family ---
-    console.print(f"[dim]Fetching available types in {region}...[/dim]")
-    paginator = ec2.get_paginator('describe_instance_type_offerings')
-    available = set()
-    for page in paginator.paginate(LocationType='region'):
-        for o in page['InstanceTypeOfferings']:
-            if pattern.match(o['InstanceType']):
-                available.add(o['InstanceType'])
-    if not available:
-        console.print(f"[yellow]No types in this category for {region}.[/yellow]")
-        return
-    families = sorted({t.split('.')[0] for t in available})
-    fam_pick = pick_from_menu("Pick a family", families)
-    if fam_pick is None:
-        return
-    family = families[fam_pick]
-
-    # --- pick size with live prices ---
-    console.print(f"[dim]Fetching sizes and prices for {family}...[/dim]")
-    sizes_resp = ec2.describe_instance_types(
-        Filters=[{'Name': 'instance-type', 'Values': [f'{family}.*']}]
-    )
-    sizes = [t for t in sizes_resp['InstanceTypes']
-             if arch in t['ProcessorInfo']['SupportedArchitectures']]
-    sizes.sort(key=lambda t: (t['VCpuInfo']['DefaultVCpus'], t['MemoryInfo']['SizeInMiB']))
-    if not sizes:
-        console.print(f"[yellow]No {family} sizes compatible with {arch} in {region}.[/yellow]")
-        return
-
-    types_in_order = [s['InstanceType'] for s in sizes]
-    prices: dict[str, str | None] = {t: None for t in types_in_order}
-    # Parallelize price fetches: each Pricing API call is 200-500ms; a family
-    # with 15-20 sizes serial = 5-10 seconds of waiting. boto3 clients are
-    # thread-safe for read operations like get_products, so sharing one
-    # client across threads is fine.
-    if location:
-        def _fetch(t: str) -> str | None:
-            return fetch_price(pricing, t, location)
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            for t, p in zip(types_in_order, pool.map(_fetch, types_in_order)):
-                prices[t] = p
-
-    table = Table(title=f"{family}.* (Linux on-demand, {region})")
-    table.add_column("#", justify="right")
-    table.add_column("Type", style="cyan")
-    table.add_column("vCPU", justify="right")
-    table.add_column("Mem (GiB)", justify="right")
-    table.add_column("Network")
-    table.add_column("USD/hr", justify="right", style="green")
-    for i, s in enumerate(sizes, 1):
-        t = s['InstanceType']
-        marker = " [bold yellow](current)[/bold yellow]" if t == current_type else ""
-        p = prices.get(t)
-        price_str = f"${float(p):.4f}" if p else "?"
-        table.add_row(
-            str(i),
-            f"{t}{marker}",
-            str(s['VCpuInfo']['DefaultVCpus']),
-            f"{s['MemoryInfo']['SizeInMiB']/1024:.1f}",
-            s['NetworkInfo']['NetworkPerformance'],
-            price_str,
+        cur = ec2.describe_instance_types(InstanceTypes=[current_type])['InstanceTypes'][0]
+        console.print(
+            f"\n[bold]Current:[/bold] [cyan]{current_type}[/cyan]  "
+            f"vCPU={cur['VCpuInfo']['DefaultVCpus']}  "
+            f"mem={cur['MemoryInfo']['SizeInMiB']/1024:.1f} GiB  "
+            f"net={cur['NetworkInfo']['NetworkPerformance']}  "
+            f"state={style_state(current_state)}  arch={arch}"
         )
-    console.print(table)
 
-    size_pick = pick_from_menu("Pick new size", types_in_order)
-    if size_pick is None:
-        return
-    new_type = types_in_order[size_pick]
-    if new_type == current_type:
-        console.print("[yellow]That's the current type. Nothing to do.[/yellow]")
-        return
+        while True:  # --- L2: pick category ---
+            console.print("\n[bold]Instance type categories[/bold]")
+            cat_pick = pick_from_menu("Pick a category", [c[0] for c in CATEGORIES])
+            if cat_pick is None:
+                break  # back to instance loop
+            pattern = re.compile(CATEGORIES[cat_pick][1])
 
-    # --- confirm and execute ---
-    console.print(
-        f"\n[bold]Resize plan:[/bold] {inst_id}  "
-        f"[cyan]{current_type}[/cyan] -> [cyan]{new_type}[/cyan]"
-    )
-    console.print("Steps: stop -> modify type -> start. Public IP will change unless an Elastic IP is attached.")
-    if not Confirm.ask("Proceed?", default=False):
-        console.print("Cancelled.")
-        return
+            console.print(f"[dim]Fetching available types in {region}...[/dim]")
+            paginator = ec2.get_paginator('describe_instance_type_offerings')
+            available = set()
+            for page in paginator.paginate(LocationType='region'):
+                for o in page['InstanceTypeOfferings']:
+                    if pattern.match(o['InstanceType']):
+                        available.add(o['InstanceType'])
+            if not available:
+                console.print(f"[yellow]No types in this category for {region}.[/yellow]")
+                continue
+            families = sorted({t.split('.')[0] for t in available})
 
-    # EC2 state transitions are asynchronous. The waiters poll
-    # DescribeInstances every ~15s until the target state is reached or a
-    # timeout fires (default 40 attempts = ~10 min). If a waiter times out
-    # it raises WaiterError, which bubbles up to main() and the user is
-    # returned to the menu with the instance left in whatever state it's in.
-    if current_state == 'running':
-        console.print(f"[dim]Stopping {inst_id}...[/dim]")
-        ec2.stop_instances(InstanceIds=[inst_id])
-        ec2.get_waiter('instance_stopped').wait(InstanceIds=[inst_id])
-        console.print("[green]Stopped.[/green]")
+            console.print(f"[dim]Fetching details for {len(available)} types...[/dim]")
+            type_details = _describe_types_batch(ec2, available)
 
-    console.print(f"[dim]Changing type to {new_type}...[/dim]")
-    ec2.modify_instance_attribute(InstanceId=inst_id, InstanceType={'Value': new_type})
+            family_info: dict[str, dict] = {}
+            for fam in families:
+                fam_types = [type_details[t] for t in available
+                             if t.split('.')[0] == fam and t in type_details]
+                if not fam_types:
+                    continue
+                archs: set[str] = set()
+                vcpus: list[int] = []
+                rams: list[float] = []
+                for t in fam_types:
+                    archs.update(t['ProcessorInfo']['SupportedArchitectures'])
+                    vcpus.append(t['VCpuInfo']['DefaultVCpus'])
+                    rams.append(t['MemoryInfo']['SizeInMiB'] / 1024)
+                family_info[fam] = {
+                    'archs': sorted(archs),
+                    'vcpu_min': min(vcpus), 'vcpu_max': max(vcpus),
+                    'ram_min': min(rams), 'ram_max': max(rams),
+                    'n_sizes': len(fam_types),
+                    'compatible': arch in archs,
+                }
 
-    console.print("[dim]Starting...[/dim]")
-    ec2.start_instances(InstanceIds=[inst_id])
-    ec2.get_waiter('instance_running').wait(InstanceIds=[inst_id])
-    console.print("[green]Running.[/green]")
+            while True:  # --- L3: pick family ---
+                fam_table = Table(title=f"Families in {region}  (current arch: [cyan]{arch}[/cyan])")
+                fam_table.add_column("#", justify="right")
+                fam_table.add_column("Family", style="cyan")
+                fam_table.add_column("Arch")
+                fam_table.add_column("vCPU", justify="right")
+                fam_table.add_column("RAM (GiB)", justify="right")
+                fam_table.add_column("Sizes", justify="right")
+                for i, fam in enumerate(families, 1):
+                    info = family_info.get(fam)
+                    if not info:
+                        continue
+                    archs_str = ", ".join(info['archs'])
+                    vcpu_str = f"{info['vcpu_min']}–{info['vcpu_max']}"
+                    ram_str = f"{info['ram_min']:.1f}–{info['ram_max']:.1f}"
+                    cells = [str(i), fam, archs_str, vcpu_str, ram_str, str(info['n_sizes'])]
+                    if not info['compatible']:
+                        cells = [f"[dim strike]{c}[/dim strike]" for c in cells]
+                    fam_table.add_row(*cells)
+                console.print(fam_table)
 
-    # --- SSH connect string ---
-    new_info = ec2.describe_instances(InstanceIds=[inst_id])['Reservations'][0]['Instances'][0]
-    new_dns = new_info.get('PublicDnsName', '')
-    new_ip = new_info.get('PublicIpAddress', '')
+                fam_pick = pick_number("Pick a family", len(families))
+                if fam_pick is None:
+                    break  # back to category loop
+                family = families[fam_pick]
+                if not family_info.get(family, {}).get('compatible'):
+                    console.print(f"[red]{family} has no sizes compatible with {arch}.[/red]")
+                    continue
 
-    ssh_user = 'ec2-user'
-    if ami_id:
-        try:
-            ami = ec2.describe_images(ImageIds=[ami_id])['Images'][0]
-            ssh_user = _ssh_user_for_ami(f"{ami.get('Name','')} {ami.get('Description','')}")
-        except (ClientError, IndexError):
-            pass
+                console.print(f"[dim]Fetching sizes and prices for {family}...[/dim]")
+                # describe_instance_types paginates with a small default page
+                # size — without get_paginator, we only see the first few sizes
+                # of any family. (Per CLAUDE.md: always paginate listing APIs.)
+                sz_paginator = ec2.get_paginator('describe_instance_types')
+                sizes = []
+                for page in sz_paginator.paginate(
+                    Filters=[{'Name': 'instance-type', 'Values': [f'{family}.*']}]
+                ):
+                    sizes.extend(page['InstanceTypes'])
+                sizes.sort(key=lambda t: (t['VCpuInfo']['DefaultVCpus'], t['MemoryInfo']['SizeInMiB']))
+                if not sizes:
+                    console.print(f"[yellow]No {family} sizes in {region}.[/yellow]")
+                    continue
 
-    key_path = _find_key_path(key_name) if key_name else "<path-to-your-ssh-key>"
-    host = new_dns or new_ip
+                def _compat(s) -> bool:
+                    return arch in s['ProcessorInfo']['SupportedArchitectures']
 
-    console.rule("[bold green]Resize complete[/bold green]")
-    console.print(f"  Instance:   {inst_id}")
-    console.print(f"  New type:   [cyan]{new_type}[/cyan]")
-    console.print(f"  Public IP:  {new_ip or '(none)'}")
-    console.print(f"  Public DNS: {new_dns or '(none)'}")
-    if host:
-        console.print("\n[bold]SSH connect:[/bold]")
-        console.print(f"  [cyan]ssh -i {key_path} {ssh_user}@{host}[/cyan]")
-    else:
-        console.print("\n[yellow]No public address (instance may be in a private subnet).[/yellow]")
-    console.rule()
+                types_in_order = [s['InstanceType'] for s in sizes]
+                prices: dict[str, str | None] = {t: None for t in types_in_order}
+                # Parallelize price fetches: each Pricing API call is 200-500ms;
+                # a family with 15-20 sizes serial = 5-10 seconds of waiting.
+                # boto3 clients are thread-safe for read operations like
+                # get_products, so sharing one client across threads is fine.
+                # Skip incompatible sizes — the user can't pick them anyway.
+                if location:
+                    compat_types = [s['InstanceType'] for s in sizes if _compat(s)]
+                    def _fetch(t: str) -> str | None:
+                        return fetch_price(pricing, t, location)
+                    with ThreadPoolExecutor(max_workers=10) as pool:
+                        for t, p in zip(compat_types, pool.map(_fetch, compat_types)):
+                            prices[t] = p
+
+                # Only show Storage / GPU columns when at least one size in the
+                # family has the data — otherwise the column is a wall of "—".
+                any_store = any(s.get('InstanceStorageSupported') for s in sizes)
+                any_gpu = any('GpuInfo' in s for s in sizes)
+
+                while True:  # --- L4: pick size ---
+                    sz_table = Table(title=f"{family}.* (Linux on-demand, {region})")
+                    sz_table.add_column("#", justify="right")
+                    sz_table.add_column("Type", style="cyan")
+                    sz_table.add_column("vCPU", justify="right")
+                    sz_table.add_column("Cores", justify="right")
+                    sz_table.add_column("RAM (GiB)", justify="right")
+                    sz_table.add_column("GHz", justify="right")
+                    sz_table.add_column("Network")
+                    if any_store:
+                        sz_table.add_column("Storage")
+                    if any_gpu:
+                        sz_table.add_column("GPU")
+                    sz_table.add_column("USD/hr", justify="right", style="green")
+                    for i, s in enumerate(sizes, 1):
+                        t = s['InstanceType']
+                        compat = _compat(s)
+                        marker = " [bold yellow](current)[/bold yellow]" if t == current_type else ""
+                        p = prices.get(t)
+                        hr_str = f"${float(p):.4f}" if p else ("—" if not compat else "?")
+
+                        vcpu = s['VCpuInfo']
+                        cores = vcpu.get('DefaultCores')
+                        ghz = s['ProcessorInfo'].get('SustainedClockSpeedInGhz')
+
+                        row = [
+                            str(i),
+                            f"{t}{marker}",
+                            str(vcpu['DefaultVCpus']),
+                            str(cores) if cores else "?",
+                            f"{s['MemoryInfo']['SizeInMiB']/1024:.1f}",
+                            f"{ghz:.1f}" if ghz else "—",
+                            s['NetworkInfo']['NetworkPerformance'],
+                        ]
+                        if any_store:
+                            if s.get('InstanceStorageSupported'):
+                                store = s.get('InstanceStorageInfo', {})
+                                total = store.get('TotalSizeInGB', '?')
+                                nvme = " NVMe" if store.get('NvmeSupport') in ('required', 'supported') else ""
+                                row.append(f"{total} GB{nvme}")
+                            else:
+                                row.append("—")
+                        if any_gpu:
+                            gpu = s.get('GpuInfo')
+                            if gpu and gpu.get('Gpus'):
+                                gpus = gpu['Gpus']
+                                total = sum(g.get('Count', 0) for g in gpus)
+                                first = gpus[0]
+                                name = f"{first.get('Manufacturer', '')} {first.get('Name', '')}".strip()
+                                row.append(f"{total}x {name}")
+                            else:
+                                row.append("—")
+                        row.append(hr_str)
+                        if not compat:
+                            row = [f"[dim strike]{c}[/dim strike]" for c in row]
+                        sz_table.add_row(*row)
+                    console.print(sz_table)
+
+                    size_pick = pick_number("Pick new size", len(sizes))
+                    if size_pick is None:
+                        break  # back to family loop
+                    new_type = types_in_order[size_pick]
+                    if not _compat(sizes[size_pick]):
+                        console.print(f"[red]{new_type} is not compatible with {arch}.[/red]")
+                        continue
+                    if new_type == current_type:
+                        console.print("[yellow]That's the current type. Nothing to do.[/yellow]")
+                        continue
+
+                    console.print(
+                        f"\n[bold]Resize plan:[/bold] {inst_id} ({name_of(sel) or 'no name'})  "
+                        f"[cyan]{current_type}[/cyan] -> [cyan]{new_type}[/cyan]"
+                    )
+                    console.print("Steps: stop -> modify type -> start. Public IP will change unless an Elastic IP is attached.")
+                    if not Confirm.ask("Proceed?", default=False):
+                        console.print("Cancelled.")
+                        continue  # back to size pick
+
+                    # --- execute ---
+                    # _wait_for_state polls DescribeInstances every 5s and
+                    # shows live state + elapsed time so the user can see the
+                    # instance walk through stopping->stopped / pending->running
+                    # rather than staring at a frozen line.
+                    if current_state == 'running':
+                        ec2.stop_instances(InstanceIds=[inst_id])
+                        _wait_for_state(ec2, inst_id, 'stopped', 'Stopping')
+
+                    console.print(f"[dim]Changing type to[/dim] [cyan]{new_type}[/cyan]...")
+                    ec2.modify_instance_attribute(InstanceId=inst_id, InstanceType={'Value': new_type})
+                    console.print("[green]✓[/green] Instance type changed.")
+
+                    ec2.start_instances(InstanceIds=[inst_id])
+                    _wait_for_state(ec2, inst_id, 'running', 'Starting')
+
+                    new_info = ec2.describe_instances(InstanceIds=[inst_id])['Reservations'][0]['Instances'][0]
+                    new_dns = new_info.get('PublicDnsName', '')
+                    new_ip = new_info.get('PublicIpAddress', '')
+
+                    ssh_user = 'ec2-user'
+                    if ami_id:
+                        try:
+                            ami = ec2.describe_images(ImageIds=[ami_id])['Images'][0]
+                            ssh_user = _ssh_user_for_ami(f"{ami.get('Name','')} {ami.get('Description','')}")
+                        except (ClientError, IndexError):
+                            pass
+
+                    key_path = _find_key_path(key_name) if key_name else "<path-to-your-ssh-key>"
+                    host = new_dns or new_ip
+
+                    console.rule("[bold green]Resize complete[/bold green]")
+                    console.print(f"  Instance:   {inst_id}")
+                    console.print(f"  New type:   [cyan]{new_type}[/cyan]")
+                    console.print(f"  Public IP:  {new_ip or '(none)'}")
+                    console.print(f"  Public DNS: {new_dns or '(none)'}")
+                    if host:
+                        # Print the ssh command flush-left so triple-click /
+                        # copy-paste grabs exactly the command with no
+                        # leading whitespace.
+                        console.print("\n[bold]SSH connect (copy/paste):[/bold]")
+                        console.print(f"[cyan]ssh -i {key_path} {ssh_user}@{host}[/cyan]")
+                    else:
+                        console.print("\n[yellow]No public address (instance may be in a private subnet).[/yellow]")
+                    console.rule()
+                    return
 
 
 # ---------- action: monthly spend breakdown ----------
